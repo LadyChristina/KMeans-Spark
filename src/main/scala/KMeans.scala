@@ -2,7 +2,7 @@ import org.apache.spark.SparkContext._
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.mllib.clustering.{KMeans, KMeansModel}
-import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.linalg.{Vector, Vectors}
 
 object KMeansApplication {
 
@@ -42,30 +42,26 @@ object KMeansApplication {
      val parsedData = cleanData.map(s => Vectors.dense(s.split(',').map(_.toDouble))).cache() // Caching for later actions on this RDD
 
 	 //Returns the smaller of two vectors based on given field
-	 def minV( v1:org.apache.spark.mllib.linalg.Vector, v2:org.apache.spark.mllib.linalg.Vector, index: Int ) :org.apache.spark.mllib.linalg.Vector  = {
+	 def minV( v1:Vector, v2:Vector, index: Int ) :Vector  = {
 	 	if (v1(index) < v2(index)) return v1 else return v2
 	 }
 	   	
 	//Returns the bigger of two vectors based on given field
-	def maxV( v1:org.apache.spark.mllib.linalg.Vector, v2:org.apache.spark.mllib.linalg.Vector, index: Int ) :org.apache.spark.mllib.linalg.Vector  = {
+	def maxV( v1:Vector, v2:Vector, index: Int ) :Vector  = {
 		if (v1(index) > v2(index)) return v1 else return v2
 	}
 
 	//Find min and max values for every field
-	val minXv = parsedData.reduce((v1,v2) => minV(v1,v2,0)) //The point with the minimum value in the first field
-	val minX = minXv(0) //The minimum value for the first field
-	val maxXv = parsedData.reduce((v1,v2) => maxV(v1,v2,0)) //The point with the maximum value in the first field
-	val maxX = maxXv(0) //The maximum value for the first field
-	val minYv = parsedData.reduce((v1,v2) => minV(v1,v2,1)) //The point with the minimum value in the second field
-	val minY = minYv(1) //The minimum value for the second field
-	val maxYv = parsedData.reduce((v1,v2) => maxV(v1,v2,1)) //The point with the maximum value in the second field
-	val maxY = maxYv(1) //The maximum value for the second field
+	val minX = parsedData.reduce(minV(_,_,0))(0) //The point with the minimum value in the first field
+	val maxX = parsedData.reduce(maxV(_,_,0))(0) //The point with the maximum value in the first field
+	val minY = parsedData.reduce(minV(_,_,1))(1) //The point with the minimum value in the second field
+	val maxY = parsedData.reduce(maxV(_,_,1))(1) //The point with the maximum value in the second field
 
 	//Normalize each "column" using the corresponding minimum and maximum values
 	val normData = parsedData.map(v => Vectors.dense((v(0)-minX)/(maxX - minX), (v(1)-minY)/(maxY-minY))).cache()
 	
 	var prevSSE = 0.0 //To keep track of the change in the SSE 
-	var numClusters=1 //We begin with 1 "cluster" 
+	var numClusters = 1 //We begin with 1 "cluster" 
 	val threshold = 0.1	//Threshold for the reduction rate of the SSE 
 	var reductionRate = 1.0 //How smaller the current SSE is compared to the previous one
 	var theSSE = 0.0
@@ -113,12 +109,14 @@ object KMeansApplication {
 	}	
 	
 	//Returns the Euclidian distance between vectors v1,v2
-	def vecDist( v1:org.apache.spark.mllib.linalg.Vector, v2:org.apache.spark.mllib.linalg.Vector ) : Double = {
+	def vecDist( v1:Vector, v2:Vector ) : Double = {
 	  return Math.sqrt(Vectors.sqdist(v1,v2))
 	}
 
-	val clusteredData = normData.map(v => (clusters.predict(v),v)) //Key: index of the appropriate cluster, Value: normalized point
+	val clusteredData = normData.map(v => (clusters.predict(v),v)).cache() //Key: index of the appropriate cluster, Value: normalized point
 					
+	val indexedCenters = sc.parallelize(clusters.clusterCenters.map(cntr => (clusters.predict(cntr),cntr))).cache() //Key: index, Value: cluster center
+
 	//Find the mean Silhouette score and the outliers for every cluster
 	for (c <- 0 to k-1)
 	{
@@ -127,26 +125,26 @@ object KMeansApplication {
 			.map(r => r._2).cache() //They are all from the same cluster so we throw the cluster index
 		val indexedCurrData = currData.zipWithIndex().cache() //We index them in order to give an id to every point
 		val numPoints = currData.count() //Number of points in this cluster
+
 		//Cartesian product in order to compute each point's distance from all other points in the same cluster
 		val intraClusterProduct = indexedCurrData.cartesian(indexedCurrData)
 			.map{case (x,y) => (x._2,vecDist(x._1,y._1))} //Key: the first point's id (from when it was indexed), Value: its distance from the second point. 
 		//In the cartesian product we also have points paired with themselves, but they don't affect our computations because their distance is 0 (doesn't affect the sum) and we divide by numPoints-1 (so that it doesn't affect the average)
 		//ai = object i's average distance from the other objects in its cluster
 		val ai = intraClusterProduct.reduceByKey((a,b) => a + b ) //Add the distances for elements with the same id (same point)
-			.map(x =>(x._1, x._2/(numPoints-1))).cache() //Key: point id, Value: average distance from its cluster
+			.map(x =>(x._1, x._2/(numPoints-1))) //Key: point id, Value: average distance from its cluster
     			
-		val indexedCenters = sc.parallelize(clusters.clusterCenters.map(cntr => (clusters.predict(cntr),cntr))) //Key: index, Value: cluster center	
 		//All centers except the current one in order to find the closest to every point
 		val otherCenters = indexedCenters.filter(x => x._1!=c )
 		val nearestCenters = indexedCurrData.cartesian(otherCenters) //Every point from this cluster with every other center
 			.map(r => (r._1._2,(r._2._1,r._1._1,vecDist(r._1._1,r._2._2)))) //Key: point id, Value: tuple (center index, point vector) 
 			.reduceByKey((a,b) => if (a._3 < b._3) a else b) //Min distance for every id 
-			.map(r => (r._2._1,(r._1, r._2._2))).cache() //Key: index to center with min distance, Value: tuple(point id, point vector)
+			.map(r => (r._2._1,(r._1, r._2._2))) //Key: index to center with min distance, Value: tuple(point id, point vector)
 		//bi = object i's minimum average distance from objects of another cluster
 		val bi = nearestCenters.join(clusteredData) //Join each point of this cluster with every point in the cluster with the nearest center (A workaround for computing bi granted that the data follow normal distribution)
 			.map(r => (r._2._1._1,(vecDist(r._2._1._2,r._2._2),1))) //Key: first point's id, Value: tuple(distance of the two points,1)
 			.reduceByKey((a,b) =>( a._1 + b._1, a._2 + b._2)) //Add the distances for every id (point) and count them 
-			.map(r => (r._1, r._2._1/r._2._2)).cache() //Key: point id, Value: average distance from nearest cluster
+			.map(r => (r._1, r._2._1/r._2._2)) //Key: point id, Value: average distance from nearest cluster
 
 		def maxD(d1 : Double, d2: Double): Double = {
 			if (d1>d2) return d1 else return d2
@@ -158,7 +156,7 @@ object KMeansApplication {
 		val meanS = s._1 / s._2 //Average silhouette score for this cluster		
 		
 		//Adds the corresponding fields of vectors v1,v2 
-		def addVectors(v1: org.apache.spark.mllib.linalg.Vector, v2: org.apache.spark.mllib.linalg.Vector): org.apache.spark.mllib.linalg.Vector = {
+		def addVectors(v1: Vector, v2: Vector): Vector = {
 			return Vectors.dense(v1(0)+v2(0),v1(1)+v2(1))
 		}
 
@@ -169,12 +167,12 @@ object KMeansApplication {
 		val variance = Vectors.dense(sumVar(0)/numPoints, sumVar(1)/numPoints)
 		val standardDev = Vectors.dense( Math.sqrt(variance(0)), Math.sqrt(variance(1)))
 		//We consider a point to be an outlier if its distance from the center of the cluster is bigger than 3*standardDeviation
-		val outliers = currData.filter(v => Math.abs(v(0) - currCenter(0)) > 3*standardDev(0) || Math.abs(v(1) - currCenter(1)) > 3*standardDev(1) )
+		val outliers = currData.filter(v => Math.abs(v(0) - currCenter(0)) > 3*standardDev(0) || Math.abs(v(1) - currCenter(1)) > 3*standardDev(1) ).cache()
 			
 		println("Cluster "+ (c+1)) 
 		val originalCenter = Vectors.dense(currCenter(0)*(maxX - minX) + minX, currCenter(1)*(maxY - minY) + minY) //Denormalization
 		println("Original Center: " + originalCenter)
-		println( "Normalized Center: " + currCenter )
+		println("Normalized Center: " + currCenter)
 		println("Mean Silhouette Score: "+ meanS)	
 		println()	
 		println("There are "+outliers.count() +" outliers in this cluster.")
